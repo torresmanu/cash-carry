@@ -17,15 +17,29 @@ for _, r in df.iterrows():
     perp = float(r["markPrice"])
     pnl = 0.0
 
+    # Open long‑spot/short‑perp arb if funding > 0
     if rate > 0 and position is None:
-        position = "ARB"
+        position = "ARB_LONG"
         entry = {"spot": spot, "perp": perp, "size": cash / perp}
 
-    if position == "ARB":
+    # Open short‑spot/long‑perp arb if funding < 0
+    if rate < 0 and position is None:
+        position = "ARB_SHORT"
+        entry = {"spot": spot, "perp": perp, "size": cash / perp}
+
+    # Collect funding payments while position open
+    if position in ("ARB_LONG","ARB_SHORT"):
         pnl += cash * rate
 
-    if rate <= 0 and position == "ARB":
+    # Close any arb when sign flips to zero or opposite
+    if position == "ARB_LONG" and rate <= 0:
         basis_move = (spot - perp) - (entry["spot"] - entry["perp"])
+        pnl += entry["size"] * basis_move
+        position = None
+
+    if position == "ARB_SHORT" and rate >= 0:
+        # For reverse arb basis: flip sign
+        basis_move = (entry["spot"] - entry["perp"]) - (spot - perp)
         pnl += entry["size"] * basis_move
         position = None
 
@@ -41,13 +55,12 @@ for _, r in df.iterrows():
 out = pd.DataFrame(results)
 out.to_csv(OUTPUT_CSV, index=False)
 
-# --- APY Calculation ---
-total_hours = (df["fundingTime"].max() - df["fundingTime"].min()).total_seconds() / 3600
-total_days = total_hours / 24
-apy = (cash / INITIAL_CASH) ** (365 / total_days) - 1
+# APY
+total_hours = (df["fundingTime"].max() - df["fundingTime"].min()).total_seconds()/3600
+apy = (cash/INITIAL_CASH)**(365/(total_hours/24)) - 1
 
-print(f"Start cash: ${INITIAL_CASH:,.2f}")
-print(f"End cash:   ${cash:,.2f}")
-print(f"Duration:   {total_days:.1f} days")
-print(f"Annual Percentage Yield (APY): {apy * 100:.2f}%")
-print(f"\nResults saved to {OUTPUT_CSV}")
+print(f"Start cash: ${INITIAL_CASH:.2f}")
+print(f"End cash:   ${cash:.2f}")
+print(f"Duration days: {total_hours/24:.1f}")
+print(f"APY: {apy*100:.2f}%")
+print(f"Results → {OUTPUT_CSV}")
