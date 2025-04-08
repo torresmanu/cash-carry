@@ -1,65 +1,109 @@
 import pandas as pd
-import pandas as pd
- 
-INPUT_CSV  = "coinm_full_data_2024.csv"
-OUTPUT_CSV = "strategy_results.csv"
+
+# Parámetros
+INPUT_CSV = "coinm_full_data_2024.csv"
+OUTPUT_CSV = "basis_empirical_results.csv"
 INITIAL_CASH = 1000.0
+THRESHOLD = 0.005   # 0.5%
+HOLD_STEPS = 3      # 24h
+SPOT_FEE = 0.001
+PERP_FEE = 0.0005
 
-df = pd.read_csv(INPUT_CSV, parse_dates=["fundingTime"]).sort_values("fundingTime")
+# Cargar data
+df = pd.read_csv(INPUT_CSV, parse_dates=["fundingTime"]).sort_values("fundingTime").reset_index(drop=True)
+df["spotPrice"] = df["spotPrice"].fillna(df["markPrice"])  # fallback
+df["basis"] = df["spotPrice"] - df["markPrice"]
+df["basis_pct"] = df["basis"] / df["spotPrice"]
+
+# Simulación
 cash = INITIAL_CASH
-position = None
-entry = {}
 results = []
+i = 0
 
-for _, r in df.iterrows():
-    rate = float(r["fundingRate"])
-    t = r["fundingTime"]
-    spot = r["spotPrice"]
-    spot = r["spotPrice"] if pd.notna(r["spotPrice"]) else float(r["markPrice"])
-    perp = float(r["markPrice"])
-    spot = float(spot) if pd.notna(spot) else perp
-
+while i < len(df) - HOLD_STEPS:
+    row = df.iloc[i]
+    spot_entry = row["spotPrice"]
+    mark_entry = row["markPrice"]
+    rate_entry = row["fundingRate"]
+    basis_pct = row["basis_pct"]
+    entry_time = row["fundingTime"]
     pnl = 0.0
+    action = "Hold"
 
-    # Open arbitrage when funding > 0
-    if rate > 0 and position is None:
-        position = "ARB"
-        entry = {"spot": spot, "perp": perp}
-        entry["size"] = cash / perp  # BTC notional
-        entry = {"spot": spot, "perp": perp, "size": cash / perp}
+    # Validación
+    if pd.isna(spot_entry) or pd.isna(mark_entry) or spot_entry <= 0 or mark_entry <= 0:
+        i += 1
+        continue
 
-    # Collect funding payments while position is open
-    if position == "ARB":
-        pnl += cash * rate
+    if abs(basis_pct) >= THRESHOLD:
+        # Salida
+        exit_row = df.iloc[i + HOLD_STEPS]
+        spot_exit = exit_row["spotPrice"]
+        mark_exit = exit_row["markPrice"]
+        funding_rates = df.iloc[i+1:i+HOLD_STEPS+1]["fundingRate"].tolist()
 
-    # Close arbitrage when funding <= 0
-    if rate <= 0 and position == "ARB":
-        basis_move = (spot - perp) - (entry["spot"] - entry["perp"])
-        pnl += entry["size"] * basis_move
-        position = None
+        if pd.isna(spot_exit) or pd.isna(mark_exit) or spot_exit <= 0 or mark_exit <= 0:
+            i += 1
+            continue
 
-    cash += pnl
+        direction = "spot_gt_mark" if basis_pct > 0 else "mark_gt_spot"
+
+        notional = cash
+        spot_fee_entry = notional * SPOT_FEE
+        perp_fee_entry = notional * PERP_FEE
+        cash -= (spot_fee_entry + perp_fee_entry)
+
+        size = notional / spot_entry if direction == "spot_gt_mark" else notional / mark_entry
+        if size <= 0 or pd.isna(size):
+            i += 1
+            continue
+
+        if direction == "spot_gt_mark":
+            spot_pnl = (spot_exit - spot_entry) * size
+            perp_pnl = (mark_entry - mark_exit) * size
+        else:
+            spot_pnl = (spot_entry - spot_exit) * size
+            perp_pnl = (mark_exit - mark_entry) * size
+
+        funding_pnl = sum([
+            rate * size * (mark_entry if direction == "spot_gt_mark" else spot_entry)
+            for rate in funding_rates if pd.notna(rate)
+        ])
+
+        close_notional = size * (spot_exit + mark_exit) / 2
+        spot_fee_exit = close_notional * SPOT_FEE
+        perp_fee_exit = close_notional * PERP_FEE
+
+        pnl = spot_pnl + perp_pnl + funding_pnl - spot_fee_exit - perp_fee_exit
+        cash += pnl
+        action = f"TRADE {direction.upper()}"
+        i += HOLD_STEPS
+    else:
+        i += 1
+
     results.append({
-        "fundingTime": t,
-        "Funding Rate": rate,
-        "Position": position or "Cash",
-        "Funding+Basis P&L": pnl,
+        "Time": entry_time,
+        "Basis %": basis_pct,
+        "Action": action,
+        "PnL": pnl,
         "Cash Balance": cash
     })
 
+# Guardar resultados
 out = pd.DataFrame(results)
 out.to_csv(OUTPUT_CSV, index=False)
 
+# Resumen
+print(f"\n✅ Backtest finalizado")
 print(f"Start cash: ${INITIAL_CASH:.2f}")
 print(f"End cash:   ${cash:.2f}")
-print(f"Results saved to {OUTPUT_CSV}")
-# --- APY Calculation ---
-total_hours = (df["fundingTime"].max() - df["fundingTime"].min()).total_seconds() / 3600
-total_days = total_hours / 24
-apy = (cash / INITIAL_CASH) ** (365 / total_days) - 1
+print(f"Total trades: {out['Action'].str.contains('TRADE').sum()}")
+print(f"Archivo exportado: {OUTPUT_CSV}")
 
-print(f"Start cash: ${INITIAL_CASH:,.2f}")
-print(f"End cash:   ${cash:,.2f}")
-print(f"Duration:   {total_days:.1f} days")
-print(f"Annual Percentage Yield (APY): {apy * 100:.2f}%")
-print(f"\nResults saved to {OUTPUT_CSV}")
+# Top y bottom trades
+trades = out[out["Action"].str.contains("TRADE")]
+print("\n🔝 Mejores trades:")
+print(trades.sort_values("PnL", ascending=False).head(5)[["Time", "PnL", "Cash Balance"]].to_string(index=False))
+
+print("\n🔻 Peores trades:")
+print(trades.sort_values("PnL").head(5)[["Time", "PnL", "Cash Balance"]].to_string(index=False))
